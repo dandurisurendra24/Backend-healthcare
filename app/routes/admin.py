@@ -16,6 +16,28 @@ def _validate_required_fields(payload, fields):
     return missing
 
 
+def _resolve_doctor_user_id(db, raw_id):
+    doctor_object_id = parse_object_id(raw_id)
+    if not doctor_object_id:
+        return None
+
+    # First try direct user id (preferred)
+    doctor_user = db.users.find_one({"_id": doctor_object_id, "role": "doctor", "is_active": True})
+    if doctor_user:
+        return doctor_user["_id"]
+
+    # Fallback: id might be from doctors collection
+    doctor_info = db.doctors.find_one({"_id": doctor_object_id})
+    if doctor_info and doctor_info.get("user_id"):
+        doctor_user = db.users.find_one(
+            {"_id": doctor_info["user_id"], "role": "doctor", "is_active": True}
+        )
+        if doctor_user:
+            return doctor_user["_id"]
+
+    return None
+
+
 @admin_bp.post("/doctors")
 @token_required(roles=["admin"])
 def create_doctor():
@@ -85,9 +107,8 @@ def create_patient():
     if db.users.find_one({"email": email}):
         return {"error": "Patient email already exists"}, 409
 
-    doctor_id = parse_object_id(payload["assigned_doctor_id"])
-    doctor = db.users.find_one({"_id": doctor_id, "role": "doctor", "is_active": True})
-    if not doctor:
+    doctor_user_id = _resolve_doctor_user_id(db, payload["assigned_doctor_id"])
+    if not doctor_user_id:
         return {"error": "Assigned doctor not found"}, 404
 
     now = datetime.now(timezone.utc)
@@ -106,7 +127,7 @@ def create_patient():
 
     profile = {
         "patient_user_id": patient_user["_id"],
-        "assigned_doctor_id": doctor["_id"],
+        "assigned_doctor_id": doctor_user_id,
         "gender": payload.get("gender", "").strip(),
         "date_of_birth": payload.get("date_of_birth", "").strip(),
         "blood_group": payload.get("blood_group", "").strip(),
@@ -124,7 +145,7 @@ def create_patient():
         "full_name": patient_user["full_name"],
         "email": patient_user["email"],
         "phone": patient_user["phone"],
-        "assigned_doctor_id": doctor["_id"],
+        "assigned_doctor_id": doctor_user_id,
         "gender": profile["gender"],
         "date_of_birth": profile["date_of_birth"],
         "blood_group": profile["blood_group"],
@@ -267,19 +288,24 @@ def update_patient(patient_id):
                 field = "password_hash"
             update_user_data[field if field != "password" else "password_hash"] = value
 
-    profile_fields = ["assigned_doctor_id", "gender", "date_of_birth", "blood_group", "address", "emergency_contact", "medical_history"]
+    profile_fields = [
+        "assigned_doctor_id",
+        "gender",
+        "date_of_birth",
+        "blood_group",
+        "address",
+        "emergency_contact",
+        "medical_history",
+    ]
     update_profile_data = {}
     for field in profile_fields:
         if field in payload:
             value = payload.get(field)
             if field == "assigned_doctor_id":
-                doctor_id = parse_object_id(value)
-                if not doctor_id:
-                    return {"error": "Invalid assigned_doctor_id"}, 400
-                doctor = db.users.find_one({"_id": doctor_id, "role": "doctor", "is_active": True})
-                if not doctor:
+                doctor_user_id = _resolve_doctor_user_id(db, value)
+                if not doctor_user_id:
                     return {"error": "Assigned doctor not found"}, 404
-                update_profile_data[field] = doctor_id
+                update_profile_data[field] = doctor_user_id
             else:
                 update_profile_data[field] = value
 
@@ -465,16 +491,15 @@ def assign_doctor(patient_id):
         return {"error": "Patient not found"}, 404
 
     payload = request.get_json(silent=True) or {}
-    doctor_id = parse_object_id(payload.get("doctor_id", ""))
-    doctor = db.users.find_one({"_id": doctor_id, "role": "doctor", "is_active": True})
-    if not doctor:
+    doctor_user_id = _resolve_doctor_user_id(db, payload.get("doctor_id", ""))
+    if not doctor_user_id:
         return {"error": "Doctor not found"}, 404
 
     db.patient_profiles.update_one(
         {"patient_user_id": patient["_id"]},
         {
             "$set": {
-                "assigned_doctor_id": doctor["_id"],
+                "assigned_doctor_id": doctor_user_id,
                 "updated_at": datetime.now(timezone.utc),
             }
         },
